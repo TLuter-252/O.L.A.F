@@ -1,0 +1,4 @@
+Data/
+*.pkl
+*.parquet
+Data/Florida_Routes.filtered.pkl
