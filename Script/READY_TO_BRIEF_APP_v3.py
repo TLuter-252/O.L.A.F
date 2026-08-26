@@ -18,8 +18,8 @@ except Exception:
 # ----------------------------
 # SETTINGS (keep these simple)
 # ----------------------------
-DEFAULT_AIS_PATH = r"C:\CODE\A_Florida\data\Florida_Routes.csv"
-HEADER_IMAGE_PATH = r"C:\CODE\A_Florida\data\Olaf.png"
+DEFAULT_AIS_PATH = r"C:\Users\1381358760.MIL\OneDrive - US Army\Desktop\AIS Data Cleaned"
+# HEADER_IMAGE_PATH = r"C:\CODE\A_Florida\data\Olaf.png"
 
 AO_LAT_MIN, AO_LAT_MAX = 25.0, 30.0
 AO_LON_MIN, AO_LON_MAX = -85.0, -80.0
@@ -485,13 +485,3 @@ if isinstance(locals().get("tracks_right"), pd.DataFrame) and not tracks_right.e
 
     export_df = export_df[EXPORT_COLS].copy()
     export_df["BaseDateTime"] = pd.to_datetime(export_df["BaseDateTime"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    st.download_button(
-        label="Download CSV",
-        data=export_df.to_csv(index=False).encode("utf-8"),
-        file_name="right_map_tracks.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-else:
-    st.caption("No RIGHT map tracks to export with the current filters.")
