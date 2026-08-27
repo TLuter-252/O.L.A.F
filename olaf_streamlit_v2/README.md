@@ -12,9 +12,10 @@ The hosted demo uses `../Florida_routes.csv` and `../Olaf.png` from the reposito
 
 ## What it does
 
-- Left map: complete vessel tracks only (no point markers), rendered as dense blue lines.
+- Left map: every drawable vessel track in the loaded dataset (no point markers), rendered as dense blue lines.
 - Right map: exactly the top one or two vessel tracks under the analyst's settings.
 - Synchronized navigation: panning or zooming either map moves the other to the same view.
+- Initial view: automatically centers on the region crossed by the most unique vessels.
 - Basemap: standard OpenStreetMap tiles, with no API key required.
 - Ranking: combines route rarity, unusual speed, and unusual course with adjustable weights.
 - Track continuity: breaks lines at analyst-defined time gaps so vessels are not joined across missing observations.

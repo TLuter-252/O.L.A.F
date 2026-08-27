@@ -19,7 +19,6 @@ DEFAULT_DATA = REPO_DIR / "Florida_routes.csv"
 HEADER_IMAGE = REPO_DIR / "Olaf.png"
 REQUIRED = {"MMSI", "BaseDateTime", "LAT", "LON", "SOG", "COG"}
 PALETTE = ["#ff3b30", "#00a8ff"]
-BASELINE_MAX_VESSELS = 1000
 
 st.set_page_config(page_title="O.L.A.F. Track Outliers", page_icon="🔎", layout="wide")
 
@@ -150,24 +149,22 @@ def add_tracks(map_object: folium.Map, df: pd.DataFrame, colors: dict[int, str],
         ).add_to(map_object)
 
 
-def add_baseline_tracks(map_object: folium.Map, df: pd.DataFrame,
-                        max_vessels: int = BASELINE_MAX_VESSELS) -> int:
-    """Add thousands of complete paths as one efficient GeoJSON layer."""
-    sizes = df.groupby("MMSI").size().sort_values(ascending=False)
-    vessel_ids = sizes[sizes >= 2].head(max_vessels).index
-    plot_df = df[df["MMSI"].isin(vessel_ids)]
-    features = []
-    for (mmsi, _segment), group in plot_df.groupby(["MMSI", "segment"], sort=False):
+def add_baseline_tracks(map_object: folium.Map, df: pd.DataFrame) -> int:
+    """Add every drawable path as one efficient GeoJSON layer."""
+    lines = []
+    vessel_ids = set()
+    for (mmsi, _segment), group in df.groupby(["MMSI", "segment"], sort=False):
         group = group.sort_values("BaseDateTime")
         coordinates = group[["LON", "LAT"]].to_numpy().tolist()
         if len(coordinates) >= 2:
-            features.append({
-                "type": "Feature",
-                "properties": {"MMSI": str(mmsi)},
-                "geometry": {"type": "LineString", "coordinates": coordinates},
-            })
+            vessel_ids.add(int(mmsi))
+            lines.append(coordinates)
     folium.GeoJson(
-        {"type": "FeatureCollection", "features": features},
+        {
+            "type": "Feature",
+            "properties": {},
+            "geometry": {"type": "MultiLineString", "coordinates": lines},
+        },
         style_function=lambda _feature: {
             "color": "#1677ff", "weight": 2, "opacity": 0.24,
         },
@@ -176,10 +173,24 @@ def add_baseline_tracks(map_object: folium.Map, df: pd.DataFrame,
     return len(vessel_ids)
 
 
+@st.cache_data(show_spinner=False)
+def densest_traffic_center(df: pd.DataFrame, cell_size: float = 0.5) -> list[float]:
+    """Find the regional cell crossed by the greatest number of unique vessels."""
+    cells = df[["MMSI", "LAT", "LON"]].copy()
+    cells["lat_cell"] = np.floor(cells["LAT"] / cell_size).astype(int)
+    cells["lon_cell"] = np.floor(cells["LON"] / cell_size).astype(int)
+    traffic = cells.groupby(["lat_cell", "lon_cell"])["MMSI"].nunique()
+    if traffic.empty:
+        return [27.8, -82.5]
+    lat_cell, lon_cell = traffic.idxmax()
+    busiest = cells[(cells["lat_cell"] == lat_cell) & (cells["lon_cell"] == lon_cell)]
+    return [float(busiest["LAT"].median()), float(busiest["LON"].median())]
+
+
 def synchronized_map(baseline: pd.DataFrame, outliers: pd.DataFrame,
                      highlighted: list[int]) -> DualMap:
     """Build two Leaflet maps whose center and zoom always stay synchronized."""
-    center = [float(baseline["LAT"].median()), float(baseline["LON"].median())]
+    center = densest_traffic_center(baseline)
     result = DualMap(location=center, zoom_start=8, tiles=None, control_scale=True)
 
     # OpenStreetMap's standard tiles do not need an API key.
@@ -190,19 +201,13 @@ def synchronized_map(baseline: pd.DataFrame, outliers: pd.DataFrame,
     colors = {mmsi: PALETTE[i % len(PALETTE)] for i, mmsi in enumerate(highlighted)}
     add_tracks(result.m2, outliers, colors, .95, 5, 800)
 
-    bounds = [
-        [float(baseline["LAT"].min()), float(baseline["LON"].min())],
-        [float(baseline["LAT"].max()), float(baseline["LON"].max())],
-    ]
-    result.m1.fit_bounds(bounds, padding=(12, 12))
-    result.m2.fit_bounds(bounds, padding=(12, 12))
     return result
 
 
 with st.sidebar:
     st.header("Analyst controls")
     uploaded = st.file_uploader("AIS CSV or ZIP", type=["csv", "zip"], help="Leave empty to use the repository's Florida demo data.")
-    min_speed = st.slider("Minimum speed (knots)", 0.0, 30.0, 0.5, 0.5)
+    min_speed = st.slider("Outlier minimum speed (knots)", 0.0, 30.0, 0.5, 0.5)
     max_gap = st.slider("Break track after gap (minutes)", 5, 240, 60, 5)
     # The cloud demo is a compact sample with at most 19 pings per vessel.
     min_pings = st.slider("Minimum pings per vessel", 3, 200, 5, 1)
@@ -228,8 +233,8 @@ except Exception as exc:
     st.error(f"AIS data could not be loaded: {exc}")
     st.stop()
 
-filtered = ais[ais["SOG"] >= min_speed].copy()
-filtered = split_segments(filtered, max_gap)
+baseline = split_segments(ais, max_gap)
+filtered = baseline[baseline["SOG"] >= min_speed].copy()
 scores = score_vessels(filtered, grid_size, min_pings, route_weight, speed_weight, course_weight)
 if scores.empty:
     st.warning("No vessels meet the current filters. Lower Minimum pings or Minimum speed.")
@@ -240,13 +245,14 @@ outlier_tracks = filtered[filtered["MMSI"].isin(selected)].copy()
 
 left, right = st.columns(2)
 with left:
-    shown_count = min(BASELINE_MAX_VESSELS, int((filtered.groupby("MMSI").size() >= 2).sum()))
+    segment_sizes = baseline.groupby(["MMSI", "segment"]).size()
+    shown_count = segment_sizes[segment_sizes >= 2].index.get_level_values("MMSI").nunique()
     st.subheader(f"Baseline · {shown_count:,} complete vessel tracks")
 with right:
     st.subheader(f"Tracks of interest · top {len(selected)}")
 st.caption("The maps are linked: pan or zoom either side and the other side follows.")
 st_folium(
-    synchronized_map(filtered, outlier_tracks, selected),
+    synchronized_map(baseline, outlier_tracks, selected),
     height=620,
     use_container_width=True,
     returned_objects=[],
