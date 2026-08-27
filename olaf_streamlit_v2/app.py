@@ -9,6 +9,7 @@ import folium
 import numpy as np
 import pandas as pd
 import streamlit as st
+from folium.plugins import DualMap
 from streamlit_folium import st_folium
 
 
@@ -137,18 +138,26 @@ def add_tracks(map_object: folium.Map, df: pd.DataFrame, colors: dict[int, str],
         ).add_to(map_object)
 
 
-def track_map(df: pd.DataFrame, highlighted: list[int] | None = None) -> folium.Map:
-    center = [float(df["LAT"].median()), float(df["LON"].median())] if not df.empty else [27.8, -82.5]
-    result = folium.Map(location=center, zoom_start=8, tiles="CartoDB positron", control_scale=True)
-    if df.empty:
-        return result
-    if highlighted:
-        colors = {mmsi: PALETTE[i % len(PALETTE)] for i, mmsi in enumerate(highlighted)}
-        add_tracks(result, df, colors, .95, 5, 800)
-    else:
-        add_tracks(result, df, {}, .24, 2, 180)
-    bounds = [[df["LAT"].min(), df["LON"].min()], [df["LAT"].max(), df["LON"].max()]]
-    result.fit_bounds(bounds, padding=(12, 12))
+def synchronized_map(baseline: pd.DataFrame, outliers: pd.DataFrame,
+                     highlighted: list[int]) -> DualMap:
+    """Build two Leaflet maps whose center and zoom always stay synchronized."""
+    center = [float(baseline["LAT"].median()), float(baseline["LON"].median())]
+    result = DualMap(location=center, zoom_start=8, tiles=None, control_scale=True)
+
+    # OpenStreetMap's standard tiles do not need an API key.
+    for pane in (result.m1, result.m2):
+        folium.TileLayer("OpenStreetMap", name="OpenStreetMap", control=False).add_to(pane)
+
+    add_tracks(result.m1, baseline, {}, .24, 2, 180)
+    colors = {mmsi: PALETTE[i % len(PALETTE)] for i, mmsi in enumerate(highlighted)}
+    add_tracks(result.m2, outliers, colors, .95, 5, 800)
+
+    bounds = [
+        [float(baseline["LAT"].min()), float(baseline["LON"].min())],
+        [float(baseline["LAT"].max()), float(baseline["LON"].max())],
+    ]
+    result.m1.fit_bounds(bounds, padding=(12, 12))
+    result.m2.fit_bounds(bounds, padding=(12, 12))
     return result
 
 
@@ -193,10 +202,15 @@ outlier_tracks = filtered[filtered["MMSI"].isin(selected)].copy()
 left, right = st.columns(2)
 with left:
     st.subheader(f"Baseline · {filtered['MMSI'].nunique():,} complete vessel tracks")
-    st_folium(track_map(filtered), height=620, use_container_width=True, returned_objects=[])
 with right:
     st.subheader(f"Tracks of interest · top {len(selected)}")
-    st_folium(track_map(outlier_tracks, selected), height=620, use_container_width=True, returned_objects=[])
+st.caption("The maps are linked: pan or zoom either side and the other side follows.")
+st_folium(
+    synchronized_map(filtered, outlier_tracks, selected),
+    height=620,
+    use_container_width=True,
+    returned_objects=[],
+)
 
 st.subheader("Why these tracks were flagged")
 display = scores.head(result_count).copy()
@@ -215,4 +229,3 @@ choice = st.selectbox("Selected MMSI", [str(m) for m in selected])
 st.link_button("Identify vessel on MarineTraffic", f"https://www.marinetraffic.com/en/ais/details/ships/mmsi:{choice}", use_container_width=True)
 export = outlier_tracks[outlier_tracks["MMSI"] == int(choice)].drop(columns="segment", errors="ignore")
 st.download_button("Download selected track", export.to_csv(index=False), f"OLAF_MMSI_{choice}.csv", "text/csv", use_container_width=True)
-

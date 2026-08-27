@@ -14,6 +14,8 @@ The hosted demo uses `../Florida_routes.csv` and `../Olaf.png` from the reposito
 
 - Left map: complete vessel tracks only (no point markers), rendered as dense blue lines.
 - Right map: exactly the top one or two vessel tracks under the analyst's settings.
+- Synchronized navigation: panning or zooming either map moves the other to the same view.
+- Basemap: standard OpenStreetMap tiles, with no API key required.
 - Ranking: combines route rarity, unusual speed, and unusual course with adjustable weights.
 - Track continuity: breaks lines at analyst-defined time gaps so vessels are not joined across missing observations.
 
@@ -23,4 +25,3 @@ Run locally from the repository root:
 pip install -r olaf_streamlit_v2/requirements.txt
 streamlit run olaf_streamlit_v2/app.py
 ```
-
