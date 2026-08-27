@@ -351,12 +351,14 @@ baseline = split_segments(ais, max_gap)
 filtered = baseline[baseline["SOG"] >= min_speed].copy()
 busy_region = densest_traffic_region(baseline)
 lat_min, lat_max, lon_min, lon_max = busy_region["bounds"]
-region_rows = filtered[
-    filtered["LAT"].between(lat_min, lat_max)
-    & filtered["LON"].between(lon_min, lon_max)
+region_rows = baseline[
+    baseline["LAT"].between(lat_min, lat_max)
+    & baseline["LON"].between(lon_min, lon_max)
 ]
-if "CrossesBusiestRegion" in filtered:
-    region_mmsi = filtered.loc[filtered["CrossesBusiestRegion"].astype(bool), "MMSI"].unique()
+if "CrossesBusiestRegion" in baseline:
+    region_mmsi = baseline.loc[
+        baseline["CrossesBusiestRegion"].astype(bool), "MMSI"
+    ].unique()
 else:
     region_mmsi = region_rows["MMSI"].unique()
 scoring_tracks = filtered[filtered["MMSI"].isin(region_mmsi)].copy()
