@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import html
 import math
 import zipfile
 from pathlib import Path
@@ -136,16 +137,23 @@ def downsample(group: pd.DataFrame, maximum: int) -> pd.DataFrame:
 
 
 def add_tracks(map_object: folium.Map, df: pd.DataFrame, colors: dict[int, str],
-               opacity: float, weight: float, max_points: int) -> None:
+               opacity: float, weight: float, max_points: int,
+               tooltips: dict[int, str] | None = None) -> None:
     for (mmsi, segment), group in df.groupby(["MMSI", "segment"], sort=False):
         group = downsample(group.sort_values("BaseDateTime"), max_points)
         coords = group[["LAT", "LON"]].to_numpy().tolist()
         if len(coords) < 2:
             continue
         name = str(group["VesselName"].dropna().iloc[0]) if "VesselName" in group and group["VesselName"].notna().any() else "Unknown"
+        tooltip_html = (
+            tooltips.get(int(mmsi))
+            if tooltips
+            else f"<b>{html.escape(name)}</b><br>MMSI {mmsi}"
+        )
         folium.PolyLine(
             coords, color=colors.get(int(mmsi), "#1677ff"), weight=weight,
-            opacity=opacity, tooltip=f"{name} · MMSI {mmsi}",
+            opacity=opacity,
+            tooltip=folium.Tooltip(tooltip_html, sticky=True, max_width=380),
         ).add_to(map_object)
 
 
@@ -194,7 +202,8 @@ def densest_traffic_region(df: pd.DataFrame, cell_size: float = 0.5) -> dict:
 
 
 def synchronized_map(baseline: pd.DataFrame, outliers: pd.DataFrame,
-                     highlighted: list[int], center: list[float]) -> DualMap:
+                     highlighted: list[int], center: list[float],
+                     outlier_tooltips: dict[int, str]) -> DualMap:
     """Build two Leaflet maps whose center and zoom always stay synchronized."""
     result = DualMap(location=center, zoom_start=8, tiles=None, control_scale=True)
 
@@ -204,8 +213,49 @@ def synchronized_map(baseline: pd.DataFrame, outliers: pd.DataFrame,
 
     add_baseline_tracks(result.m1, baseline)
     colors = {mmsi: PALETTE[i % len(PALETTE)] for i, mmsi in enumerate(highlighted)}
-    add_tracks(result.m2, outliers, colors, .95, 5, 800)
+    add_tracks(result.m2, outliers, colors, .95, 5, 800, outlier_tooltips)
 
+    return result
+
+
+def build_outlier_tooltips(scores: pd.DataFrame, selected: list[int],
+                           weights: dict[str, float]) -> dict[int, str]:
+    """Explain each selected vessel using the analyst's current weighting."""
+    explanations = {
+        "route": "Route uses traffic cells visited by relatively few peer vessels.",
+        "speed": "Median or peak speed differs from the peer-vessel pattern.",
+        "course": "Mean course differs from the dominant local traffic flow.",
+    }
+    labels = {"route": "Route rarity", "speed": "Speed", "course": "Course"}
+    result = {}
+    total_weight = max(sum(weights.values()), 0.001)
+    indexed = scores.set_index("MMSI")
+    for mmsi in selected:
+        row = indexed.loc[mmsi]
+        components = []
+        for key in ["route", "speed", "course"]:
+            score = float(row[f"{key}_score"])
+            contribution = weights[key] * score / total_weight
+            components.append((key, score, contribution))
+        components.sort(key=lambda item: item[2], reverse=True)
+        primary = components[0]
+        secondary = components[1]
+        reason = explanations[primary[0]]
+        if secondary[2] >= primary[2] * 0.75 and weights[secondary[0]] > 0:
+            reason += f" {labels[secondary[0]]} was also a major contributor."
+        result[int(mmsi)] = (
+            f"<div style='min-width:290px;line-height:1.35'>"
+            f"<b>MMSI {int(mmsi)}</b><br>"
+            f"<b>Why flagged:</b> {reason}<br>"
+            f"<b>Overall outlier score:</b> {float(row['outlier_score']) * 100:.1f}%<br>"
+            f"Route {float(row['route_score']) * 100:.0f}% &nbsp;·&nbsp; "
+            f"Speed {float(row['speed_score']) * 100:.0f}% &nbsp;·&nbsp; "
+            f"Course {float(row['course_score']) * 100:.0f}%<br>"
+            f"{int(row['points'])} pings &nbsp;·&nbsp; "
+            f"median SOG {float(row['median_speed']):.1f} kn &nbsp;·&nbsp; "
+            f"95th percentile SOG {float(row['max_speed']):.1f} kn"
+            f"</div>"
+        )
     return result
 
 
@@ -255,6 +305,11 @@ if scores.empty:
 
 selected = scores.head(result_count)["MMSI"].astype(int).tolist()
 outlier_tracks = filtered[filtered["MMSI"].isin(selected)].copy()
+outlier_tooltips = build_outlier_tooltips(
+    scores,
+    selected,
+    {"route": route_weight, "speed": speed_weight, "course": course_weight},
+)
 
 left, right = st.columns(2)
 with left:
@@ -266,7 +321,9 @@ with right:
 st.caption("The maps are linked: pan or zoom either side and the other side follows.")
 st.caption("Outliers are ranked among vessels crossing the busiest default region.")
 st_folium(
-    synchronized_map(baseline, outlier_tracks, selected, busy_region["center"]),
+    synchronized_map(
+        baseline, outlier_tracks, selected, busy_region["center"], outlier_tooltips
+    ),
     height=620,
     use_container_width=True,
     returned_objects=[],
