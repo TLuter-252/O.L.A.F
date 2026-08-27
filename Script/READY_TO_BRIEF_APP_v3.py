@@ -18,8 +18,9 @@ except Exception:
 # ----------------------------
 # SETTINGS (keep these simple)
 # ----------------------------
-DEFAULT_AIS_PATH = r"C:\Users\1381358760.MIL\OneDrive - US Army\Desktop\AIS Data Cleaned"
-# HEADER_IMAGE_PATH = r"C:\CODE\A_Florida\data\Olaf.png"
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/TLuter-252/O.L.A.F/main"
+AIS_DATA_URL = f"{GITHUB_RAW_BASE}/Florida_routes.csv"
+HEADER_IMAGE_URL = f"{GITHUB_RAW_BASE}/Olaf.png"
 
 AO_LAT_MIN, AO_LAT_MAX = 25.0, 30.0
 AO_LON_MIN, AO_LON_MAX = -85.0, -80.0
@@ -38,8 +39,8 @@ RIGHT_MAX_TOTAL_POINTS = 70_000
 RIGHT_MAX_VESSELS = 60
 
 # Cache files (simple + works on any OS)
-PROJECT = Path(__file__).resolve().parents[1]
-DATA_DIR = PROJECT / "data"
+PROJECT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT / ".olaf_cache"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_PARQUET = DATA_DIR / "Florida_Routes.filtered.parquet"
 CACHE_META = DATA_DIR / "Florida_Routes.filtered.meta.txt"
@@ -65,8 +66,7 @@ with h1:
     )
     st.caption("Baseline routes on the left. Outlier tracks on the right.")
 with h2:
-    if os.path.exists(HEADER_IMAGE_PATH):
-        st.image(HEADER_IMAGE_PATH, use_container_width=True)
+    st.image(HEADER_IMAGE_URL, use_container_width=True)
 
 st.session_state.setdefault("clicked_mmsi", "")
 st.session_state.setdefault("ais_class_mode", "Class B")
@@ -190,24 +190,23 @@ def build_filtered_df_from_csv(csv_path: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=True)
-def load_ais(csv_path: str) -> pd.DataFrame:
-    if not csv_path or not os.path.exists(csv_path):
+@st.cache_data(show_spinner=True, ttl=3600)
+def load_ais(csv_source: str) -> pd.DataFrame:
+    """
+    Load AIS data from GitHub (or a local file if one is supplied later).
+    Streamlit Cloud can read the raw GitHub URL directly.
+    """
+    if not csv_source:
         return pd.DataFrame()
 
-    stamp_now = csv_stamp(csv_path)
-    stamp_old = read_meta()
+    is_url = csv_source.startswith(("http://", "https://"))
+    if not is_url and not os.path.exists(csv_source):
+        return pd.DataFrame()
 
-    # If CSV has not changed, use cached parquet if possible
-    if stamp_now == stamp_old and CACHE_PARQUET.exists():
-        try:
-            return pd.read_parquet(CACHE_PARQUET)
-        except Exception:
-            pass
-
-    df = build_filtered_df_from_csv(csv_path)
-    write_meta(stamp_now)
-    return df
+    try:
+        return build_filtered_df_from_csv(csv_source)
+    except Exception:
+        return pd.DataFrame()
 
 
 # ----------------------------
@@ -356,7 +355,8 @@ def build_right_map(tracks: pd.DataFrame, max_gap_min: int) -> folium.Map:
 # ----------------------------
 st.sidebar.markdown("## AIS Filters")
 
-AIS_PATH = st.sidebar.text_input("AIS CSV path", DEFAULT_AIS_PATH)
+AIS_PATH = AIS_DATA_URL
+st.sidebar.caption("AIS data source: GitHub")
 
 st.session_state["ais_class_mode"] = st.sidebar.selectbox(
     "AIS Class (RIGHT map only)",
@@ -379,7 +379,10 @@ show_only_topk = st.sidebar.checkbox("Right map: show ONLY Top choices", value=T
 # ----------------------------
 ais = load_ais(AIS_PATH)
 if ais.empty:
-    st.error("No AIS data loaded. Check the CSV path / columns.")
+    st.error(
+        "No AIS data loaded from GitHub. Make sure Florida_routes.csv is public, "
+        "uses the expected columns, and is not stored as a Git LFS pointer."
+    )
     st.stop()
 
 
