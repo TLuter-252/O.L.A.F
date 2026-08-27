@@ -166,7 +166,7 @@ def add_baseline_tracks(map_object: folium.Map, df: pd.DataFrame) -> int:
             "geometry": {"type": "MultiLineString", "coordinates": lines},
         },
         style_function=lambda _feature: {
-            "color": "#1677ff", "weight": 2, "opacity": 0.24,
+            "color": "#006dff", "weight": 2.25, "opacity": 0.62,
         },
         name="Baseline vessel tracks",
     ).add_to(map_object)
@@ -174,23 +174,28 @@ def add_baseline_tracks(map_object: folium.Map, df: pd.DataFrame) -> int:
 
 
 @st.cache_data(show_spinner=False)
-def densest_traffic_center(df: pd.DataFrame, cell_size: float = 0.5) -> list[float]:
+def densest_traffic_region(df: pd.DataFrame, cell_size: float = 0.5) -> dict:
     """Find the regional cell crossed by the greatest number of unique vessels."""
     cells = df[["MMSI", "LAT", "LON"]].copy()
     cells["lat_cell"] = np.floor(cells["LAT"] / cell_size).astype(int)
     cells["lon_cell"] = np.floor(cells["LON"] / cell_size).astype(int)
     traffic = cells.groupby(["lat_cell", "lon_cell"])["MMSI"].nunique()
     if traffic.empty:
-        return [27.8, -82.5]
+        return {"center": [27.8, -82.5], "bounds": [27.55, 28.05, -82.75, -82.25]}
     lat_cell, lon_cell = traffic.idxmax()
     busiest = cells[(cells["lat_cell"] == lat_cell) & (cells["lon_cell"] == lon_cell)]
-    return [float(busiest["LAT"].median()), float(busiest["LON"].median())]
+    return {
+        "center": [float(busiest["LAT"].median()), float(busiest["LON"].median())],
+        "bounds": [
+            lat_cell * cell_size, (lat_cell + 1) * cell_size,
+            lon_cell * cell_size, (lon_cell + 1) * cell_size,
+        ],
+    }
 
 
 def synchronized_map(baseline: pd.DataFrame, outliers: pd.DataFrame,
-                     highlighted: list[int]) -> DualMap:
+                     highlighted: list[int], center: list[float]) -> DualMap:
     """Build two Leaflet maps whose center and zoom always stay synchronized."""
-    center = densest_traffic_center(baseline)
     result = DualMap(location=center, zoom_start=8, tiles=None, control_scale=True)
 
     # OpenStreetMap's standard tiles do not need an API key.
@@ -235,7 +240,15 @@ except Exception as exc:
 
 baseline = split_segments(ais, max_gap)
 filtered = baseline[baseline["SOG"] >= min_speed].copy()
-scores = score_vessels(filtered, grid_size, min_pings, route_weight, speed_weight, course_weight)
+busy_region = densest_traffic_region(baseline)
+lat_min, lat_max, lon_min, lon_max = busy_region["bounds"]
+region_rows = filtered[
+    filtered["LAT"].between(lat_min, lat_max)
+    & filtered["LON"].between(lon_min, lon_max)
+]
+region_mmsi = region_rows["MMSI"].unique()
+scoring_tracks = filtered[filtered["MMSI"].isin(region_mmsi)].copy()
+scores = score_vessels(scoring_tracks, grid_size, min_pings, route_weight, speed_weight, course_weight)
 if scores.empty:
     st.warning("No vessels meet the current filters. Lower Minimum pings or Minimum speed.")
     st.stop()
@@ -251,8 +264,9 @@ with left:
 with right:
     st.subheader(f"Tracks of interest · top {len(selected)}")
 st.caption("The maps are linked: pan or zoom either side and the other side follows.")
+st.caption("Outliers are ranked among vessels crossing the busiest default region.")
 st_folium(
-    synchronized_map(baseline, outlier_tracks, selected),
+    synchronized_map(baseline, outlier_tracks, selected, busy_region["center"]),
     height=620,
     use_container_width=True,
     returned_objects=[],
