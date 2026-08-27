@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+import io
+import math
+import zipfile
+from pathlib import Path
+
+import folium
+import numpy as np
+import pandas as pd
+import streamlit as st
+from streamlit_folium import st_folium
+
+
+APP_DIR = Path(__file__).resolve().parent
+REPO_DIR = APP_DIR.parent
+DEFAULT_DATA = REPO_DIR / "Florida_routes.csv"
+HEADER_IMAGE = REPO_DIR / "Olaf.png"
+REQUIRED = {"MMSI", "BaseDateTime", "LAT", "LON", "SOG", "COG"}
+PALETTE = ["#ff3b30", "#00a8ff"]
+
+st.set_page_config(page_title="O.L.A.F. Track Outliers", page_icon="🔎", layout="wide")
+
+
+def clean_frame(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = df.columns.str.strip()
+    missing = REQUIRED.difference(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
+    keep = [c for c in ["MMSI", "VesselName", "BaseDateTime", "LAT", "LON", "SOG", "COG", "Status", "TransceiverClass"] if c in df]
+    df = df[keep].copy()
+    df["BaseDateTime"] = pd.to_datetime(df["BaseDateTime"], errors="coerce", utc=True)
+    for col in ["MMSI", "LAT", "LON", "SOG", "COG"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["MMSI", "BaseDateTime", "LAT", "LON", "SOG", "COG"])
+    df = df[df["LAT"].between(-90, 90) & df["LON"].between(-180, 180)]
+    df["MMSI"] = df["MMSI"].astype("int64")
+    return df.sort_values(["MMSI", "BaseDateTime"]).drop_duplicates(["MMSI", "BaseDateTime"])
+
+
+@st.cache_data(show_spinner="Loading AIS tracks…")
+def load_default(path: str) -> pd.DataFrame:
+    return clean_frame(pd.read_csv(path, low_memory=False))
+
+
+@st.cache_data(show_spinner="Reading uploaded AIS file…")
+def load_upload(raw: bytes, name: str) -> pd.DataFrame:
+    if name.lower().endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            csv_names = [n for n in archive.namelist() if n.lower().endswith(".csv")]
+            if not csv_names:
+                raise ValueError("The ZIP contains no CSV file.")
+            with archive.open(csv_names[0]) as stream:
+                return clean_frame(pd.read_csv(stream, low_memory=False))
+    return clean_frame(pd.read_csv(io.BytesIO(raw), low_memory=False))
+
+
+def split_segments(df: pd.DataFrame, max_gap_minutes: int) -> pd.DataFrame:
+    df = df.copy()
+    gaps = df.groupby("MMSI")["BaseDateTime"].diff().dt.total_seconds().div(60)
+    df["segment"] = ((gaps > max_gap_minutes) | gaps.isna()).groupby(df["MMSI"]).cumsum().astype(int)
+    return df
+
+
+def circular_mean_deg(values: pd.Series) -> float:
+    radians = np.deg2rad(values.dropna().to_numpy() % 360)
+    if not len(radians):
+        return np.nan
+    return float(np.rad2deg(np.arctan2(np.sin(radians).mean(), np.cos(radians).mean())) % 360)
+
+
+def robust01(values: pd.Series) -> pd.Series:
+    values = values.astype(float)
+    med = values.median()
+    mad = (values - med).abs().median()
+    if not np.isfinite(mad) or mad < 1e-9:
+        ranks = values.rank(pct=True)
+        return ranks.fillna(0.5)
+    z = (values - med).abs() / (1.4826 * mad)
+    return (1 - np.exp(-z / 2)).clip(0, 1).fillna(0)
+
+
+@st.cache_data(show_spinner="Scoring route, speed, and course behavior…")
+def score_vessels(df: pd.DataFrame, grid_degrees: float, min_pings: int,
+                  route_weight: float, speed_weight: float, course_weight: float) -> pd.DataFrame:
+    work = df.copy()
+    work["cell_lat"] = np.floor(work["LAT"] / grid_degrees).astype(int)
+    work["cell_lon"] = np.floor(work["LON"] / grid_degrees).astype(int)
+    occupancy = work.groupby(["cell_lat", "cell_lon"])["MMSI"].nunique()
+    work = work.join(occupancy.rename("cell_vessels"), on=["cell_lat", "cell_lon"])
+    work["rare_ping"] = 1 / np.sqrt(work["cell_vessels"].clip(lower=1))
+
+    features = work.groupby("MMSI").agg(
+        points=("MMSI", "size"),
+        route_rarity=("rare_ping", "mean"),
+        median_speed=("SOG", "median"),
+        max_speed=("SOG", lambda s: s.quantile(.95)),
+        course=("COG", circular_mean_deg),
+    )
+    features = features[features["points"] >= min_pings].copy()
+    if features.empty:
+        return features.reset_index()
+
+    radians = np.deg2rad(features["course"])
+    center = math.atan2(np.sin(radians).mean(), np.cos(radians).mean())
+    features["course_difference"] = np.abs(np.angle(np.exp(1j * (radians - center)))) / np.pi
+    features["route_score"] = robust01(features["route_rarity"])
+    features["speed_score"] = (robust01(features["median_speed"]) + robust01(features["max_speed"])) / 2
+    features["course_score"] = robust01(features["course_difference"])
+    total_weight = route_weight + speed_weight + course_weight
+    features["outlier_score"] = (
+        route_weight * features["route_score"]
+        + speed_weight * features["speed_score"]
+        + course_weight * features["course_score"]
+    ) / max(total_weight, 0.001)
+    return features.sort_values("outlier_score", ascending=False).reset_index()
+
+
+def downsample(group: pd.DataFrame, maximum: int) -> pd.DataFrame:
+    if len(group) <= maximum:
+        return group
+    indexes = np.linspace(0, len(group) - 1, maximum, dtype=int)
+    return group.iloc[indexes]
+
+
+def add_tracks(map_object: folium.Map, df: pd.DataFrame, colors: dict[int, str],
+               opacity: float, weight: float, max_points: int) -> None:
+    for (mmsi, segment), group in df.groupby(["MMSI", "segment"], sort=False):
+        group = downsample(group.sort_values("BaseDateTime"), max_points)
+        coords = group[["LAT", "LON"]].to_numpy().tolist()
+        if len(coords) < 2:
+            continue
+        name = str(group["VesselName"].dropna().iloc[0]) if "VesselName" in group and group["VesselName"].notna().any() else "Unknown"
+        folium.PolyLine(
+            coords, color=colors.get(int(mmsi), "#1677ff"), weight=weight,
+            opacity=opacity, tooltip=f"{name} · MMSI {mmsi}",
+        ).add_to(map_object)
+
+
+def track_map(df: pd.DataFrame, highlighted: list[int] | None = None) -> folium.Map:
+    center = [float(df["LAT"].median()), float(df["LON"].median())] if not df.empty else [27.8, -82.5]
+    result = folium.Map(location=center, zoom_start=8, tiles="CartoDB positron", control_scale=True)
+    if df.empty:
+        return result
+    if highlighted:
+        colors = {mmsi: PALETTE[i % len(PALETTE)] for i, mmsi in enumerate(highlighted)}
+        add_tracks(result, df, colors, .95, 5, 800)
+    else:
+        add_tracks(result, df, {}, .24, 2, 180)
+    bounds = [[df["LAT"].min(), df["LON"].min()], [df["LAT"].max(), df["LON"].max()]]
+    result.fit_bounds(bounds, padding=(12, 12))
+    return result
+
+
+with st.sidebar:
+    st.header("Analyst controls")
+    uploaded = st.file_uploader("AIS CSV or ZIP", type=["csv", "zip"], help="Leave empty to use the repository's Florida demo data.")
+    min_speed = st.slider("Minimum speed (knots)", 0.0, 30.0, 0.5, 0.5)
+    max_gap = st.slider("Break track after gap (minutes)", 5, 240, 60, 5)
+    min_pings = st.slider("Minimum pings per vessel", 5, 200, 20, 5)
+    grid_size = st.slider("Traffic grid size (degrees)", 0.01, 0.25, 0.05, 0.01)
+    st.caption("Choose what 'unusual' means")
+    route_weight = st.slider("Route / traffic pattern", 0.0, 3.0, 2.0, 0.25)
+    speed_weight = st.slider("Speed behavior", 0.0, 3.0, 1.0, 0.25)
+    course_weight = st.slider("Course behavior", 0.0, 3.0, 1.0, 0.25)
+    result_count = st.radio("Tracks on right map", [1, 2], horizontal=True, index=1)
+
+head, art = st.columns([4, 1])
+with head:
+    st.title("O.L.A.F.")
+    st.subheader("Outlier & Low-frequency Analysis Framework")
+    st.caption("All vessel tracks on the left. Only the strongest analyst-tuned outliers on the right.")
+with art:
+    if HEADER_IMAGE.exists():
+        st.image(str(HEADER_IMAGE), use_container_width=True)
+
+try:
+    ais = load_upload(uploaded.getvalue(), uploaded.name) if uploaded else load_default(str(DEFAULT_DATA))
+except Exception as exc:
+    st.error(f"AIS data could not be loaded: {exc}")
+    st.stop()
+
+filtered = ais[ais["SOG"] >= min_speed].copy()
+filtered = split_segments(filtered, max_gap)
+scores = score_vessels(filtered, grid_size, min_pings, route_weight, speed_weight, course_weight)
+if scores.empty:
+    st.warning("No vessels meet the current filters. Lower Minimum pings or Minimum speed.")
+    st.stop()
+
+selected = scores.head(result_count)["MMSI"].astype(int).tolist()
+outlier_tracks = filtered[filtered["MMSI"].isin(selected)].copy()
+
+left, right = st.columns(2)
+with left:
+    st.subheader(f"Baseline · {filtered['MMSI'].nunique():,} complete vessel tracks")
+    st_folium(track_map(filtered), height=620, use_container_width=True, returned_objects=[])
+with right:
+    st.subheader(f"Tracks of interest · top {len(selected)}")
+    st_folium(track_map(outlier_tracks, selected), height=620, use_container_width=True, returned_objects=[])
+
+st.subheader("Why these tracks were flagged")
+display = scores.head(result_count).copy()
+display["MMSI"] = display["MMSI"].astype(str)
+for col in ["outlier_score", "route_score", "speed_score", "course_score"]:
+    display[col] = (display[col] * 100).round(1)
+st.dataframe(
+    display[["MMSI", "points", "outlier_score", "route_score", "speed_score", "course_score", "median_speed", "max_speed"]],
+    column_config={
+        "outlier_score": "Overall %", "route_score": "Route %", "speed_score": "Speed %",
+        "course_score": "Course %", "median_speed": "Median SOG", "max_speed": "95th % SOG",
+    }, hide_index=True, use_container_width=True,
+)
+
+choice = st.selectbox("Selected MMSI", [str(m) for m in selected])
+st.link_button("Identify vessel on MarineTraffic", f"https://www.marinetraffic.com/en/ais/details/ships/mmsi:{choice}", use_container_width=True)
+export = outlier_tracks[outlier_tracks["MMSI"] == int(choice)].drop(columns="segment", errors="ignore")
+st.download_button("Download selected track", export.to_csv(index=False), f"OLAF_MMSI_{choice}.csv", "text/csv", use_container_width=True)
+
