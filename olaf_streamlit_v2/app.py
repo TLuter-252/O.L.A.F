@@ -153,7 +153,9 @@ def add_tracks(map_object: folium.Map, df: pd.DataFrame, colors: dict[int, str],
         folium.PolyLine(
             coords, color=colors.get(int(mmsi), "#1677ff"), weight=weight,
             opacity=opacity,
-            tooltip=folium.Tooltip(tooltip_html, sticky=True, max_width=380),
+            tooltip=folium.Tooltip(
+                tooltip_html, sticky=True, direction="right", max_width=275
+            ),
         ).add_to(map_object)
 
 
@@ -244,7 +246,7 @@ def build_outlier_tooltips(scores: pd.DataFrame, selected: list[int],
         if secondary[2] >= primary[2] * 0.75 and weights[secondary[0]] > 0:
             reason += f" {labels[secondary[0]]} was also a major contributor."
         result[int(mmsi)] = (
-            f"<div style='min-width:290px;line-height:1.35'>"
+            f"<div style='width:250px;line-height:1.35;white-space:normal'>"
             f"<b>MMSI {int(mmsi)}</b><br>"
             f"<b>Why flagged:</b> {reason}<br>"
             f"<b>Overall outlier score:</b> {float(row['outlier_score']) * 100:.1f}%<br>"
